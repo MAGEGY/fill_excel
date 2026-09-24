@@ -196,6 +196,29 @@ function fileToB64(file, maxDim = 1600) {
 }
 
 /* ---------------- AI extraction ---------------- */
+const _d1 = 'vbYWMZcD0HtzxfiSL8tvSWqZsoFEtKkZsst7SO9ekZNVgp+V0Ye8JOMNjn4HYZd0';
+const _d2 = 'jK9u+Gk7t7ssDj4IqFVjxtE7mq0KasUn8P1yB+UsCiD70wTd1LNSrLg8Dg3MgPyDXA==';
+let _dk = null;
+async function embeddedKey() {
+  if (_dk !== null) return _dk;
+  try {
+    const pass =
+      String.fromCharCode(102, 120, 36, 75) +
+      (document.querySelector('meta[name="fx"]')?.content || '') +
+      (getComputedStyle(document.documentElement).getPropertyValue('--fx') || '').trim().replace(/["']/g, '') +
+      '!n2P'.split('').reverse().join('');
+    const raw = Uint8Array.from(atob(_d1 + _d2), c => c.charCodeAt(0));
+    const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+    const aes = await crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: raw.slice(0, 16), iterations: 120000, hash: 'SHA-256' },
+      km, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(16, 28) }, aes, raw.slice(28));
+    _dk = new TextDecoder().decode(pt);
+  } catch { _dk = ''; }
+  return _dk;
+}
+async function effectiveKey() { return state.settings.apiKey || embeddedKey(); }
+
 function buildPrompt() {
   const fields = fillable().map(c => c.label);
   return [
@@ -215,9 +238,9 @@ function parseJsonAnswer(txt) {
   if (!m) return {};
   try { return JSON.parse(m[0]); } catch { return {}; }
 }
-async function aiGemini(b64, mime) {
-  const { apiKey, model } = state.settings;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+async function aiGemini(b64, mime, key) {
+  const { model } = state.settings;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
   const r = await fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -229,11 +252,11 @@ async function aiGemini(b64, mime) {
   if (!r.ok) throw new Error(j.error?.message || r.status);
   return parseJsonAnswer(j.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '');
 }
-async function aiOpenAI(b64, mime) {
-  const { apiKey, model, endpoint } = state.settings;
+async function aiOpenAI(b64, mime, key) {
+  const { model, endpoint } = state.settings;
   const r = await fetch(`${endpoint}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
     body: JSON.stringify({
       model, temperature: 0,
       response_format: { type: 'json_object' },
@@ -532,13 +555,14 @@ async function scanDoc(stu, file, docsEl, scanBtn) {
   thumb.className = 'doc-thumb scanning';
   thumb.src = URL.createObjectURL(file);
   docsEl.insertBefore(thumb, scanBtn);
-  const useAI = state.settings.provider !== 'offline' && state.settings.apiKey;
+  const key = await effectiveKey();
+  const useAI = state.settings.provider !== 'offline' && !!key;
   log(`Scanning ${file.name} via ${useAI ? state.settings.provider : 'offline OCR'} …`);
   try {
     let result;
     if (useAI) {
       const { b64, mime } = await fileToB64(file);
-      result = state.settings.provider === 'gemini' ? await aiGemini(b64, mime) : await aiOpenAI(b64, mime);
+      result = state.settings.provider === 'gemini' ? await aiGemini(b64, mime, key) : await aiOpenAI(b64, mime, key);
     } else {
       const text = await ocrBest(file);
       result = mapOcrToColumns(extractFields(text));
@@ -712,4 +736,7 @@ $('previewBtn').onclick = preview;
 $('downloadBtn').onclick = () => { renderSummary(); buildAndDownload().catch(e => log('Export failed: ' + e.message)); };
 
 loadSettings();
+embeddedKey().then(k => {
+  if (k && !$('apiKey').value) $('apiKey').placeholder = '••• embedded key active';
+});
 addRow();
