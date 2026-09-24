@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fill Excel from Documents — AI</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Fill Excel from Documents</h1>
+  <p class="sub">Upload any Excel, scan document images per row — AI reads the fields, you preview &amp; download.</p>
+</header>
+
+<main>
+  <!-- STEP 0 : AI settings -->
+  <section class="card" id="step0">
+    <h2><span class="stepnum">0</span> AI engine</h2>
+    <div class="row">
+      <label>Provider
+        <select id="provider">
+          <option value="gemini">Google Gemini</option>
+          <option value="openai">OpenAI-compatible</option>
+          <option value="offline">Offline OCR (no AI)</option>
+        </select>
+      </label>
+      <label id="keyWrap">API key
+        <input type="password" id="apiKey" placeholder="paste key" autocomplete="off">
+      </label>
+      <label id="modelWrap">Model
+        <input type="text" id="model" value="gemini-2.5-flash">
+      </label>
+      <label id="endpointWrap" class="hidden">Endpoint
+        <input type="text" id="endpoint" value="https://api.openai.com/v1">
+      </label>
+      <button class="btn small" id="saveSettings">Save</button>
+      <span id="settingsMsg" class="muted"></span>
+    </div>
+    <p class="muted">Gemini free key: <b>aistudio.google.com</b> → “Get API key”. Key is stored only in this browser.</p>
+  </section>
+
+  <!-- STEP 1 : excel -->
+  <section class="card" id="step1">
+    <h2><span class="stepnum">1</span> Excel file to fill</h2>
+    <div class="row">
+      <label class="btn file-btn">
+        Choose .xlsx file
+        <input type="file" id="excelInput" accept=".xlsx,.xlsm" hidden>
+      </label>
+      <span id="excelName" class="muted">No file — a default column set will be created</span>
+    </div>
+    <div id="mappingBox" class="mapping hidden">
+      <div class="row">
+        <label>Sheet <select id="sheetSel"></select></label>
+        <label>Header row <input type="number" id="headerRowInput" min="1" style="width:70px"></label>
+        <button class="btn small" id="redetect">Re-detect</button>
+      </div>
+      <h3>Fields to fill <span class="muted">(uncheck to skip a column)</span></h3>
+      <div id="mappingList"></div>
+    </div>
+  </section>
+
+  <!-- STEP 2 : rows -->
+  <section class="card" id="step2">
+    <h2><span class="stepnum">2</span> Rows &amp; documents</h2>
+    <p class="muted">Each card = one Excel row. Press the small <b>+</b> inside a card to scan a document for that row.
+    Fields still empty are flagged <b>missing</b> — scan another document or press <b>ignore</b>.</p>
+    <div id="rows"></div>
+    <button class="btn add" id="addRowBtn">+ Add row</button>
+  </section>
+
+  <!-- STEP 3 : output -->
+  <section class="card" id="step3">
+    <h2><span class="stepnum">3</span> Preview &amp; download</h2>
+    <div class="row">
+      <button class="btn" id="previewBtn">Preview</button>
+      <button class="btn primary" id="downloadBtn">Download Excel</button>
+    </div>
+    <div id="missingSummary" class="missing-summary hidden"></div>
+    <div id="previewWrap" class="preview hidden"></div>
+  </section>
+
+  <div id="log" class="log"></div>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
