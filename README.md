@@ -18,13 +18,16 @@ A client-side web app that fills any Excel sheet from photos/scans of documents
    numbers and continue them for new rows.
 3. **Rows** — press **+ Add row** per record (or just scan into the first
    card). Inside each row press the small **+** to scan document images —
-   select as many as you like at once. Scans are **grouped by person**:
-   documents sharing a name or ID number (passport / iqama) merge into the
-   same row, and each unrecognized person automatically opens a new row —
-   e.g. 20 pictures of 18 students produce 18 rows. A photo that shows
-   several people returns one record per person. Fields still empty are
-   flagged **missing** — scan another document for that person, or press
-   **ignore**.
+   select as many as you like at once. Scans are **grouped by entity**, for
+   any kind of sheet and any kind of document: records that share an
+   ID-like value (passport, iqama, national ID, plate, invoice no, …) or a
+   matching name merge into the same row; the AI also tags every record with
+   who/what it is about, so sheets without name/ID columns group correctly
+   too. Only an unrecognized entity opens a new row — e.g. 20 pictures of 18
+   students produce 18 rows. Phone numbers are never used for matching
+   (siblings share a parent's mobile). A photo that shows several people
+   returns one record per person. Fields still empty are flagged
+   **missing** — scan another document for that entity, or press **ignore**.
 4. **Preview & download** — Preview renders the sheet as it will look after
    download: the original title/header rows (with merged cells), the existing
    data rows, then the new rows highlighted. New rows are **appended after the

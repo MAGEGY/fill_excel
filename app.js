@@ -272,23 +272,27 @@ function renderMapping() {
 const fillable = () => activeColumns().filter(c => !c.skip && c.kind !== 'serial');
 const activeColumns = () => state.columns.length ? state.columns : DEFAULT_COLS.map((l, i) => ({ col: i + 1, label: l, kind: classify(l), stdKey: stdKeyOf(l), skip: false }));
 
-/* ---------------- person matching ----------------
-   Scans of the same person arrive across several pictures (passport, iqama,
-   birth certificate, …). Group them: a record joins the row of the person it
-   belongs to; only an unrecognized person opens a new row. */
-const colsForMatching = () => state.columns.length ? state.columns : activeColumns();
-function colIdxOf(stdKey) {
-  const c = colsForMatching().find(c => c.stdKey === stdKey && !c.skip);
-  return c ? c.col : null;
-}
-function recValue(rec, stdKey) {
-  const c = colsForMatching().find(c => c.stdKey === stdKey && !c.skip);
-  return c ? String(rec[c.label] ?? '').trim() : '';
-}
-function rowVal(stu, stdKey) {
-  const col = colIdxOf(stdKey);
-  return col === null ? '' : (stu.values[col] || '').trim();
-}
+/* ---------------- entity matching ----------------
+   Scans of the same person/entity arrive across several pictures. Group them
+   generically, for ANY sheet: a record joins the row of the entity it belongs
+   to; only an unrecognized entity opens a new row.
+   Evidence, in order of strength:
+     1. ID-like columns (passport, iqama, national ID, invoice no, plate, …):
+        equal → same entity; both present but different → different entity.
+        Phone columns are excluded (siblings share a parent's mobile).
+     2. Name-like columns: fuzzy token match (order-insensitive, partial names).
+     3. The AI's per-record identity hint (WHO_KEY) for sheets with neither. */
+const WHO_KEY = '__who';
+const NAME_COL_RE = /name|الاسم|اسم|student|employee|customer|patient|owner|applicant|holder|person|company|entity|title|الشركة|المؤسسة|الطالب|الموظف|العميل|المريض/i;
+const PHONE_COL_RE = /mobile|phone|tel|whatsapp|هاتف|جوال|موبايل|واتس/i;
+const ID_COL_RE = /passport|iqama|اقامة|إقامة|national|identity|\bid\b|id\s*(no|number)|number|no\.?$|رقم|هوية|جواز|serial|reference|ref\.?|invoice|plate|code|كود|مرجع|فاتورة|لوحة/i;
+const matchCols = () => activeColumns().filter(c => !c.skip && c.kind !== 'serial');
+const idCols   = () => matchCols().filter(c => ID_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label) && !NAME_COL_RE.test(c.label) && c.kind !== 'date');
+const nameCols = () => matchCols().filter(c => NAME_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label));
+const isNameCol = c => NAME_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label);
+const recVal = (rec, c) => String(rec[c.label] ?? '').trim();
+const rowVal = (stu, c) => (stu.values[c.col] || '').trim();
+const normId = s => (s || '').toUpperCase().replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)).replace(/[^\p{L}\p{N}]/gu, '');
 function normName(s) {
   return (s || '').toUpperCase()
     .replace(/[\u064B-\u0652\u0670]/g, '')            // Arabic tashkeel
@@ -308,19 +312,24 @@ function nameMatch(a, b) {
   // forward order, or one document printed "Surname, Given"
   return nameMatch1(A, B) || nameMatch1([...A].reverse(), B) || nameMatch1(A, [...B].reverse());
 }
+const recWho = rec => String(rec[WHO_KEY] ?? '').trim();
 function hasIdentifiers(rec) {
-  return !!(recValue(rec, 'name_en') || recValue(rec, 'name_ar') ||
-            recValue(rec, 'passport') || recValue(rec, 'iqama'));
+  return idCols().some(c => recVal(rec, c)) || nameCols().some(c => recVal(rec, c)) || !!recWho(rec);
 }
 function findPersonRow(rec) {
-  const rNameEn = recValue(rec, 'name_en'), rNameAr = recValue(rec, 'name_ar');
-  const rPass = recValue(rec, 'passport'), rIqama = recValue(rec, 'iqama');
+  const ids = idCols(), names = nameCols(), who = recWho(rec);
   for (const stu of state.rows) {
-    const sPass = rowVal(stu, 'passport'), sIqama = rowVal(stu, 'iqama');
-    if ((rPass && sPass && rPass === sPass) || (rIqama && sIqama && rIqama === sIqama)) return stu;
-    if ((rPass && sPass && rPass !== sPass) || (rIqama && sIqama && rIqama !== sIqama)) continue; // different IDs → different person
-    if ((rNameEn && nameMatch(rNameEn, rowVal(stu, 'name_en'))) ||
-        (rNameAr && nameMatch(rNameAr, rowVal(stu, 'name_ar')))) return stu;
+    let idSame = false, idDiff = false;
+    for (const c of ids) {
+      const a = normId(recVal(rec, c)), b = normId(rowVal(stu, c));
+      if (a && b) { if (a === b) idSame = true; else idDiff = true; }
+    }
+    if (idSame) return stu;
+    if (idDiff) continue;                               // conflicting IDs → different entity
+    if (names.some(c => recVal(rec, c) && nameMatch(recVal(rec, c), rowVal(stu, c)))) return stu;
+    if (who && ((stu.who && nameMatch(who, stu.who)) ||
+                names.some(c => nameMatch(who, rowVal(stu, c))) ||
+                ids.some(c => rowVal(stu, c) && normId(who) === normId(rowVal(stu, c))))) return stu;
   }
   return null;
 }
@@ -371,16 +380,18 @@ function buildPrompt() {
   const fields = fillable().map(c => c.label);
   return [
     'You are extracting data from a document photo to fill spreadsheet rows.',
+    'The document can be of any kind (ID card, passport, certificate, form, invoice, receipt, letter, list, table, …).',
     `Fields to find (use these EXACT strings as JSON keys): ${JSON.stringify(fields)}`,
     'Rules:',
-    '- Reply with ONLY JSON: {"rows": [{"Field": "value"}, ...]} — one object per person/record.',
+    `- Reply with ONLY JSON: {"rows": [{"${WHO_KEY}": "...", "Field": "value"}, ...]} — one object per person/entity/record.`,
+    `- "${WHO_KEY}" = who/what this record is about, for grouping across documents: the full name of the person (or company/item), else the main ID number. Empty string if not determinable.`,
     '- If the image shows a single document/person, "rows" has ONE object.',
     '- If the image shows a list, table, or several documents/people, return one object per line/person — do not stop after the first.',
-    '- Omit fields not visible in the document.',
+    '- Fill a field only with data visible in the document that fits the field\'s meaning; omit fields not present.',
     '- All dates in dd/mm/yyyy format.',
-    '- Keep Arabic text in Arabic script; Latin names in Latin script. Do not translate.',
-    '- For name fields, always give the person\'s FULL name (all parts, in document order) — never split one name across multiple fields.',
-    '- ID and phone numbers as plain digits only.',
+    '- Keep Arabic text in Arabic script; Latin text in Latin script. Do not translate.',
+    '- For name fields, always give the FULL name (all parts, in document order) — never split one name across multiple fields.',
+    '- ID and phone numbers as plain digits/characters only.',
     '- If the image is rotated, mentally rotate it first.',
   ].join('\n');
 }
@@ -625,7 +636,7 @@ function mapOcrToColumns(found) {
 /* ---------------- rows ---------------- */
 const rowsEl = $('rows');
 function addRow() {
-  const stu = { id: ++state.seq, values: {}, ignored: new Set(), docs: [] };
+  const stu = { id: ++state.seq, values: {}, ignored: new Set(), docs: [], who: '' };
   state.rows.push(stu);
   renderRow(stu);
   renumber();
@@ -720,12 +731,13 @@ function applyResult(stu, obj) {
     if (!cur) {
       stu.values[c.col] = v;
       applied.push(`${c.label}=${v}`);
-    } else if ((c.stdKey === 'name_en' || c.stdKey === 'name_ar') &&
-               nameMatch(cur, v) && normName(v).length > normName(cur).length) {
+    } else if (isNameCol(c) && nameMatch(cur, v) && normName(v).length > normName(cur).length) {
       stu.values[c.col] = v;             // a fuller version of the same name
       applied.push(`${c.label}=${v} (full name)`);
     }
   }
+  const who = recWho(obj);
+  if (who && (!stu.who || normName(who).length > normName(stu.who).length)) stu.who = who;
   const card = $(`stu-${stu.id}`);
   if (card) card.querySelectorAll('input[data-col]').forEach(inp => {
     inp.value = stu.values[+inp.dataset.col] || '';
@@ -751,24 +763,26 @@ async function scanDoc(stu, file, docsEl, scanBtn) {
       const text = await ocrBest(file);
       results = [mapOcrToColumns(extractFields(text))];
     }
-    // Route each extracted record to the row of the person it belongs to:
-    // matching name/ID → merge into that row; new person → new row; a record
-    // with no readable name/ID continues the row currently being scanned.
-    results = results.filter(o => o && typeof o === 'object' && Object.keys(o).length);
+    // Route each extracted record to the row of the entity it belongs to:
+    // matching ID/name/identity → merge into that row; new entity → new row;
+    // a record with no identifying data at all continues the most recently
+    // touched row (usually the same entity's previous document).
+    results = results.filter(o => o && typeof o === 'object' && Object.keys(o).some(k => k !== WHO_KEY && String(o[k] ?? '').trim()));
     for (let i = 0; i < results.length; i++) {
       const rec = results[i];
       let target, how;
       if ((target = findPersonRow(rec))) {
-        how = `same person → merged into Row ${state.rows.indexOf(target) + 1}`;
+        how = `same ${rec[WHO_KEY] ? `entity (${rec[WHO_KEY]})` : 'entity'} → merged into Row ${state.rows.indexOf(target) + 1}`;
       } else if (hasIdentifiers(rec)) {
         const stuEmpty = !fillable().some(c => (stu.values[c.col] || '').trim());
         target = stuEmpty ? stu : addRow();
-        how = `new person → Row ${state.rows.indexOf(target) + 1}`;
+        how = `new ${rec[WHO_KEY] ? `entity (${rec[WHO_KEY]})` : 'entity'} → Row ${state.rows.indexOf(target) + 1}`;
       } else {
-        target = rowMissing(stu).length ? stu : state.rows[state.rows.length - 1];
-        how = `no name/ID on document → Row ${state.rows.indexOf(target) + 1}`;
+        target = state.lastTouched && state.rows.includes(state.lastTouched) ? state.lastTouched : stu;
+        how = `no identifying data on document → Row ${state.rows.indexOf(target) + 1}`;
       }
       const applied = applyResult(target, rec);
+      state.lastTouched = target;
       log(`${file.name}${results.length > 1 ? ` (record ${i + 1})` : ''}: ${how}${applied.length ? ' — ' + applied.join(', ') : ' — nothing new'}`);
     }
     if (!results.length) log(`${file.name}: nothing extracted`);
