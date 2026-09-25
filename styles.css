@@ -95,6 +95,13 @@ main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
 .preview th { background: #2e7d32; color: #fff; }
 .preview td.miss { background: #ffebee; }
 .preview td[dir="rtl"] { text-align: right; }
+.preview .rownum { background: #fafafa; color: #999; font-size: 11px; text-align: center; min-width: 34px; }
+.preview tr.hdr td { background: #eef7ee; font-weight: 600; }
+.preview tr.ctx td { color: #333; }
+.preview tr.new td { background: #eaf5ea; }
+.preview tr.new td.miss { background: #ffebee; }
+.preview tr.new td.rownum { background: #eaf5ea; color: #1b5e20; font-weight: 600; }
+.preview td.num { text-align: center; }
 .missing-summary {
   margin-top: 12px; padding: 10px 14px; border-radius: 8px; font-size: 13px;
   background: #ffebee; border: 1px solid #ef9a9a; color: #b71c1c;

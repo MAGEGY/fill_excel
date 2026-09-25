@@ -60,6 +60,37 @@ function parseDMY(s) {
   const d = +m[1], mo = +m[2], y = +m[3];
   return (d >= 1 && d <= 31 && mo >= 1 && mo <= 12) ? new Date(y, mo - 1, d) : null;
 }
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+function colLettersToNum(letters) {
+  let n = 0;
+  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n;
+}
+/* Merged cells: ExcelJS gives every slave cell the master's value, so a merged
+   title row looks like N identical headers. We need the ranges to (a) skip
+   slaves when detecting columns and (b) render colspan/rowspan in preview. */
+function mergeInfo(ws) {
+  const mi = { ranges: [], slaves: new Set(), spans: {} };
+  for (const range of (ws.model && ws.model.merges) || []) {
+    const m = String(range).match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
+    if (!m) continue;
+    const c1 = colLettersToNum(m[1]), r1 = +m[2], c2 = colLettersToNum(m[3]), r2 = +m[4];
+    mi.ranges.push({ r1, c1, r2, c2 });
+    mi.spans[`${r1}:${c1}`] = { cs: c2 - c1 + 1, rs: r2 - r1 + 1 };
+    for (let r = r1; r <= r2; r++)
+      for (let c = c1; c <= c2; c++)
+        if (r !== r1 || c !== c1) mi.slaves.add(`${r}:${c}`);
+  }
+  return mi;
+}
+/* If cell (r,c) sits inside a merged range, returns the master's "r:c" key; else null. */
+function mergeMaster(mi, r, c) {
+  for (const g of mi.ranges)
+    if (r >= g.r1 && r <= g.r2 && c >= g.c1 && c <= g.c2) return `${g.r1}:${g.c1}`;
+  return null;
+}
 const logEl = document.getElementById('log');
 function log(msg) {
   const d = document.createElement('div');
@@ -106,10 +137,39 @@ $('saveSettings').onclick = () => {
 };
 
 /* ---------------- excel template ---------------- */
-async function loadExcel(file) {
+async function loadWorkbook(buf) {
   const wb = new ExcelJS.Workbook();
-  const buf = await file.arrayBuffer();
   await wb.xlsx.load(buf);
+  return wb;
+}
+/* Some templates (e.g. saved by WPS Office) embed drawings whose XML uses a
+   default namespace, which crashes ExcelJS's drawing parser. Strip the
+   drawings out and retry — the data cells are what matter. */
+async function stripDrawings(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  Object.keys(zip.files).forEach(n => { if (/^xl\/drawings\//.test(n)) zip.remove(n); });
+  for (const n of Object.keys(zip.files)) {
+    if (/^xl\/worksheets\/sheet\d+\.xml$/.test(n)) {
+      let xml = await zip.file(n).async('string');
+      xml = xml.replace(/<drawing[^>]*\/>/g, '').replace(/<legacyDrawing[^>]*\/>/g, '');
+      zip.file(n, xml);
+    } else if (/^xl\/worksheets\/_rels\/sheet\d+\.xml\.rels$/.test(n)) {
+      let xml = await zip.file(n).async('string');
+      xml = xml.replace(/<Relationship[^>]*Type="[^"]*\/drawing"[^>]*\/>/g, '');
+      zip.file(n, xml);
+    }
+  }
+  return zip.generateAsync({ type: 'arraybuffer' });
+}
+async function loadExcel(file) {
+  const buf = await file.arrayBuffer();
+  let wb;
+  try {
+    wb = await loadWorkbook(buf);
+  } catch (e) {
+    log(`Template load issue (${e.message}) — retrying without embedded images …`);
+    wb = await loadWorkbook(await stripDrawings(buf));
+  }
   state.excelBuffer = buf;
   state.excelName = file.name;
   state.workbook = wb;
@@ -123,16 +183,23 @@ async function loadExcel(file) {
     sel.appendChild(o);
   });
 
-  // auto-detect header row: row with most text cells, prefer one matching known fields
+  // auto-detect header row: row with most DISTINCT text cells (merged slave
+  // cells repeat the master's value and must not count), preferring rows whose
+  // labels match known fields
   let best = { score: -1, row: 1 };
   const ws = wb.worksheets[0];
+  const mi = mergeInfo(ws);
   for (let r = 1; r <= Math.min(ws.rowCount, 50); r++) {
-    let texts = 0, known = 0;
-    ws.getRow(r).eachCell({ includeEmpty: false }, c => {
+    const labels = new Set();
+    let known = 0;
+    ws.getRow(r).eachCell({ includeEmpty: false }, (c, col) => {
+      if (mi.slaves.has(`${r}:${col}`)) return;
       const t = String(c.value ?? '').trim();
-      if (t && isNaN(Number(t))) { texts++; if (stdKeyOf(t)) known++; }
+      if (!t || !isNaN(Number(t))) return;
+      if (!labels.has(t) && stdKeyOf(t)) known++;
+      labels.add(t);
     });
-    const score = texts + known * 3;
+    const score = labels.size + known * 5;
     if (score > best.score) best = { score, row: r };
   }
   state.sheetName = ws.name;
@@ -140,26 +207,54 @@ async function loadExcel(file) {
   $('headerRowInput').value = best.row;
   detectColumns();
   $('mappingBox').classList.remove('hidden');
-  log(`Template "${file.name}": sheet "${ws.name}", header row ${best.row}, ${state.columns.length} columns.`);
+  log(`Template "${file.name}": sheet "${ws.name}", header row ${best.row}, ${state.columns.length} columns, new data starts at row ${state.dataStart}.`);
 }
 
 function detectColumns() {
   const ws = state.workbook.getWorksheet(state.sheetName);
   const hr = +$('headerRowInput').value || 1;
   state.headerRow = hr;
+  state.mergeInfo = mergeInfo(ws);
   state.columns = [];
   const seen = {};
   ws.getRow(hr).eachCell({ includeEmpty: false }, (cell, col) => {
+    if (state.mergeInfo.slaves.has(`${hr}:${col}`)) return; // merged slave — not a real column
     let label = String(cell.value ?? '').trim();
     if (!label) return;
     if (seen[label]) label = `${label} (${col})`;
     seen[label] = true;
     state.columns.push({ col, label, kind: classify(label), stdKey: stdKeyOf(label), skip: false });
   });
+  state.dataStart = findDataStart(ws, hr);
   // clear row values that no longer correspond to columns
   state.rows.forEach(stu => { stu.values = {}; stu.ignored = new Set(); });
   renderMapping();
   rerenderAllRows();
+}
+
+/* First row below the header that can actually hold per-column data and is
+   still empty. Rows inside/below merged ranges can't hold distinct values and
+   are skipped; rows that already contain data (existing students) are skipped
+   too, so new rows are appended after them instead of overwriting. */
+function findDataStart(ws, headerRow) {
+  const serialCols = new Set(state.columns.filter(c => c.kind === 'serial').map(c => c.col));
+  const last = Math.min(ws.rowCount, headerRow + 5000);
+  for (let r = headerRow + 1; r <= last; r++) {
+    // unusable if any column's cell is covered by a merge (writes would be lost)
+    if (state.mergeInfo.ranges.length) {
+      const merged = state.columns.some(c => mergeMaster(state.mergeInfo, r, c.col));
+      if (merged) continue;
+    }
+    let hasData = false;
+    ws.getRow(r).eachCell({ includeEmpty: false }, (cell, col) => {
+      if (serialCols.has(col)) return;
+      if (state.mergeInfo.slaves.has(`${r}:${col}`)) return;
+      const v = cell.value;
+      if (v !== null && v !== undefined && String(typeof v === 'object' && v.text ? v.text : v).trim() !== '') hasData = true;
+    });
+    if (!hasData) return r;
+  }
+  return last + 1;
 }
 
 function renderMapping() {
@@ -168,7 +263,7 @@ function renderMapping() {
   for (const c of state.columns) {
     const chip = document.createElement('span');
     chip.className = 'chip' + (c.skip ? ' off' : '');
-    chip.innerHTML = `<input type="checkbox" ${c.skip ? '' : 'checked'}> ${c.label} <span class="kind">${c.kind}</span>`;
+    chip.innerHTML = `<input type="checkbox" ${c.skip ? '' : 'checked'}> ${esc(c.label)} <span class="kind">${c.kind}</span>`;
     chip.querySelector('input').onchange = e => { c.skip = !e.target.checked; chip.classList.toggle('off', c.skip); rerenderAllRows(); };
     list.appendChild(chip);
   }
@@ -222,21 +317,33 @@ async function effectiveKey() { return state.settings.apiKey || embeddedKey(); }
 function buildPrompt() {
   const fields = fillable().map(c => c.label);
   return [
-    'You are extracting data from a document photo to fill one spreadsheet row.',
+    'You are extracting data from a document photo to fill spreadsheet rows.',
     `Fields to find (use these EXACT strings as JSON keys): ${JSON.stringify(fields)}`,
     'Rules:',
-    '- Reply with ONLY a JSON object like {"Field": "value"}. Omit fields not visible in this document.',
+    '- Reply with ONLY JSON: {"rows": [{"Field": "value"}, ...]} — one object per person/record.',
+    '- If the image shows a single document/person, "rows" has ONE object.',
+    '- If the image shows a list, table, or several documents/people, return one object per line/person — do not stop after the first.',
+    '- Omit fields not visible in the document.',
     '- All dates in dd/mm/yyyy format.',
     '- Keep Arabic text in Arabic script; Latin names in Latin script. Do not translate.',
+    '- For name fields, always give the person\'s FULL name (all parts, in document order) — never split one name across multiple fields.',
     '- ID and phone numbers as plain digits only.',
     '- If the image is rotated, mentally rotate it first.',
-    '- If the document shows several people, extract the main document holder.',
   ].join('\n');
 }
-function parseJsonAnswer(txt) {
-  const m = (txt || '').match(/\{[\s\S]*\}/);
-  if (!m) return {};
-  try { return JSON.parse(m[0]); } catch { return {}; }
+function parseJsonAnswers(txt) {
+  const t = (txt || '').trim();
+  let v = null;
+  try { v = JSON.parse(t); } catch {
+    const m = t.match(/\{[\s\S]*\}/) || t.match(/\[[\s\S]*\]/);
+    if (m) { try { v = JSON.parse(m[0]); } catch {} }
+  }
+  if (Array.isArray(v)) return v.filter(o => o && typeof o === 'object');
+  if (v && typeof v === 'object') {
+    if (Array.isArray(v.rows)) return v.rows.filter(o => o && typeof o === 'object');
+    return [v];
+  }
+  return [];
 }
 async function aiGemini(b64, mime, key) {
   const { model } = state.settings;
@@ -250,7 +357,7 @@ async function aiGemini(b64, mime, key) {
   });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error?.message || r.status);
-  return parseJsonAnswer(j.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '');
+  return parseJsonAnswers(j.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '');
 }
 async function aiOpenAI(b64, mime, key) {
   const { model, endpoint } = state.settings;
@@ -268,7 +375,7 @@ async function aiOpenAI(b64, mime, key) {
   });
   const j = await r.json();
   if (!r.ok) throw new Error(j.error?.message || r.status);
-  return parseJsonAnswer(j.choices?.[0]?.message?.content || '');
+  return parseJsonAnswers(j.choices?.[0]?.message?.content || '');
 }
 
 /* ---------------- offline OCR (fallback) ---------------- */
@@ -469,6 +576,7 @@ function addRow() {
   state.rows.push(stu);
   renderRow(stu);
   renumber();
+  return stu;
 }
 function delRow(stu) {
   state.rows = state.rows.filter(r => r !== stu);
@@ -478,7 +586,7 @@ function delRow(stu) {
 function renumber() {
   state.rows.forEach((s, i) => {
     const h = document.querySelector(`#stu-${s.id} h3`);
-    if (h) h.innerHTML = `Row ${i + 1} <span class="muted">(Excel row ${(state.headerRow || 0) + i + 1})</span>`;
+    if (h) h.innerHTML = `Row ${i + 1} <span class="muted">(Excel row ${(state.dataStart || (state.headerRow || 1) + 1) + i})</span>`;
   });
 }
 function rerenderAllRows() {
@@ -528,7 +636,7 @@ function renderRow(stu) {
     wrap.className = 'field';
     const isAr = ARABIC_HINT.test(c.label);
     wrap.innerHTML = `
-      <label>${c.label}
+      <label>${esc(c.label)}
         <span>
           <span class="status miss" data-role="status"></span>
           <button class="ignore-btn" data-role="ignore" type="button">ignore</button>
@@ -550,6 +658,23 @@ function renderRow(stu) {
   refreshRow(stu);
 }
 
+function applyResult(stu, obj) {
+  const applied = [];
+  for (const c of fillable()) {
+    const v = (obj[c.label] ?? '').toString().trim();
+    if (v && !stu.values[c.col] && !stu.ignored.has(c.col)) {
+      stu.values[c.col] = v;
+      applied.push(`${c.label}=${v}`);
+    }
+  }
+  const card = $(`stu-${stu.id}`);
+  if (card) card.querySelectorAll('input[data-col]').forEach(inp => {
+    inp.value = stu.values[+inp.dataset.col] || '';
+  });
+  refreshRow(stu);
+  return applied;
+}
+
 async function scanDoc(stu, file, docsEl, scanBtn) {
   const thumb = document.createElement('img');
   thumb.className = 'doc-thumb scanning';
@@ -559,28 +684,23 @@ async function scanDoc(stu, file, docsEl, scanBtn) {
   const useAI = state.settings.provider !== 'offline' && !!key;
   log(`Scanning ${file.name} via ${useAI ? state.settings.provider : 'offline OCR'} …`);
   try {
-    let result;
+    let results;
     if (useAI) {
       const { b64, mime } = await fileToB64(file);
-      result = state.settings.provider === 'gemini' ? await aiGemini(b64, mime, key) : await aiOpenAI(b64, mime, key);
+      results = state.settings.provider === 'gemini' ? await aiGemini(b64, mime, key) : await aiOpenAI(b64, mime, key);
     } else {
       const text = await ocrBest(file);
-      result = mapOcrToColumns(extractFields(text));
+      results = [mapOcrToColumns(extractFields(text))];
     }
-    const applied = [];
-    for (const c of fillable()) {
-      const v = (result[c.label] ?? '').toString().trim();
-      if (v && !stu.values[c.col] && !stu.ignored.has(c.col)) {
-        stu.values[c.col] = v;
-        applied.push(`${c.label}=${v}`);
-      }
+    // First record goes to this row; extra people/records create new rows.
+    results = results.filter(o => o && typeof o === 'object' && Object.keys(o).length);
+    for (let i = 0; i < results.length; i++) {
+      const target = i === 0 ? stu : addRow();
+      const applied = applyResult(target, results[i]);
+      log(`${file.name}${i ? ` (record ${i + 1} → Row ${state.rows.indexOf(target) + 1})` : ''}: ${applied.length ? 'filled → ' + applied.join(', ') : 'nothing new extracted'}`);
     }
+    if (!results.length) log(`${file.name}: nothing extracted`);
     stu.docs.push({ name: file.name });
-    log(`${file.name}: ${applied.length ? 'filled → ' + applied.join(', ') : 'nothing new extracted'}`);
-    const card = document.getElementById(`stu-${stu.id}`);
-    card.querySelectorAll('input[data-col]').forEach(inp => {
-      inp.value = stu.values[+inp.dataset.col] || '';
-    });
   } catch (e) {
     log(`Scan failed for ${file.name}: ${e.message}`);
     alert(`Scan failed: ${e.message}`);
@@ -616,18 +736,112 @@ function refreshRow(stu) {
 }
 
 /* ---------------- preview ---------------- */
+function numVal(v) {
+  if (v && typeof v === 'object') v = v.text ?? v.result ?? null;
+  const n = typeof v === 'number' ? v : parseFloat(v);
+  return isFinite(n) ? n : null;
+}
+/* Next free serial number: max numeric serial in the data area + 1. */
+function startSerial(ws, serialCol) {
+  let next = 1;
+  if (serialCol && state.headerRow) {
+    const end = state.dataStart || state.headerRow + 1;
+    for (let r = state.headerRow + 1; r < end; r++) {
+      const n = numVal(ws.getCell(r, serialCol.col).value);
+      if (n !== null) next = Math.max(next, n + 1);
+    }
+  }
+  return next;
+}
+
 function preview() {
   const wrap = $('previewWrap');
+  const wb = state.workbook;
+  const ws = wb && wb.getWorksheet(state.sheetName);
   const cols = activeColumns().filter(c => !c.skip);
-  let html = '<table><tr>' + cols.map(c => `<th>${c.label}</th>`).join('') + '</tr>';
+  const serialCol = cols.find(c => c.kind === 'serial');
+
+  if (!ws || !state.headerRow) {
+    // no template (or no header found) — plain table of the fields
+    let html = '<table><tr><th class="rownum">#</th>' + cols.map(c => `<th>${esc(c.label)}</th>`).join('') + '</tr>';
+    let ns = 1;
+    state.rows.forEach((stu, i) => {
+      html += '<tr class="new"><td class="rownum">' + (i + 1) + '</td>' + cols.map(c => {
+        if (c.kind === 'serial') return `<td>${ns++}</td>`;
+        const v = (stu.values[c.col] || '').trim();
+        const cls = v || stu.ignored.has(c.col) ? '' : ' class="miss"';
+        const dir = hasArabic(v) ? ' dir="rtl"' : '';
+        return `<td${cls}${dir}>${v ? esc(v) : (stu.ignored.has(c.col) ? '—' : 'MISSING')}</td>`;
+      }).join('') + '</tr>';
+    });
+    wrap.innerHTML = html + '</table>';
+    wrap.classList.remove('hidden');
+    renderSummary();
+    return;
+  }
+
+  // WYSIWYG: render the sheet as it will look after download —
+  // title/header rows (with merges), existing data rows, then the new rows.
+  const mi = state.mergeInfo || { ranges: [], slaves: new Set(), spans: {} };
+  const hr = state.headerRow;
+  const start = state.dataStart || hr + 1;
+  const colByIdx = {};
+  for (const c of activeColumns()) colByIdx[c.col] = c;
+
+  let lastCol = 1;
+  for (let r = 1; r <= Math.min(hr, ws.rowCount); r++)
+    ws.getRow(r).eachCell({ includeEmpty: false }, (cell, col) => { lastCol = Math.max(lastCol, col); });
+  for (const g of mi.ranges) if (g.r1 <= hr) lastCol = Math.max(lastCol, g.c2);
+  for (const c of cols) lastCol = Math.max(lastCol, c.col);
+
+  const covered = new Set();
+  const sheetRow = (r, cls) => {
+    let h = `<tr class="${cls}"><td class="rownum">${r}</td>`;
+    for (let c = 1; c <= lastCol; c++) {
+      const key = `${r}:${c}`;
+      if (covered.has(key) || mi.slaves.has(key)) continue;
+      const sp = mi.spans[key];
+      if (sp) {
+        for (let rr = r; rr < r + sp.rs; rr++)
+          for (let cc = c; cc < c + sp.cs; cc++)
+            if (rr !== r || cc !== c) covered.add(`${rr}:${cc}`);
+        h += `<td colspan="${sp.cs}"${sp.rs > 1 ? ` rowspan="${sp.rs}"` : ''}>${esc(ws.getCell(r, c).text)}</td>`;
+      } else {
+        h += `<td>${esc(ws.getCell(r, c).text)}</td>`;
+      }
+    }
+    return h + '</tr>';
+  };
+
+  let html = '<table>';
+  for (let r = 1; r <= hr; r++) html += sheetRow(r, r === hr ? 'hdr' : 'ctx');
+  for (let r = hr + 1; r < start; r++) {
+    if (r - hr > 30) { // cap context rows
+      html += `<tr class="ctx"><td class="rownum">…</td><td colspan="${lastCol}">… ${start - r} existing row(s) …</td></tr>`;
+      break;
+    }
+    html += sheetRow(r, 'ctx');
+  }
+
+  let ns = startSerial(ws, serialCol);
   state.rows.forEach((stu, i) => {
-    html += '<tr>' + cols.map(c => {
-      if (c.kind === 'serial') return `<td>${i + 1}</td>`;
-      const v = (stu.values[c.col] || '').trim();
-      const cls = v || stu.ignored.has(c.col) ? '' : ' class="miss"';
+    const r = start + i;
+    html += `<tr class="new"><td class="rownum">${r}</td>`;
+    for (let c = 1; c <= lastCol; c++) {
+      const def = colByIdx[c];
+      if (!def || def.skip) { html += '<td></td>'; continue; }
+      if (def.kind === 'serial') {
+        const n = numVal(ws.getCell(r, c).value);
+        if (n !== null) { ns = Math.max(ns, n + 1); html += `<td class="num">${n}</td>`; }
+        else html += `<td class="num">${ns++}</td>`;
+        continue;
+      }
+      const v = (stu.values[c] || '').trim();
+      const cls = v || stu.ignored.has(c) ? '' : ' class="miss"';
       const dir = hasArabic(v) ? ' dir="rtl"' : '';
-      return `<td${cls}${dir}>${v || (stu.ignored.has(c.col) ? '—' : 'MISSING')}</td>`;
-    }).join('') + '</tr>';
+      html += `<td${cls}${dir}>${v ? esc(v) : (stu.ignored.has(c) ? '—' : 'MISSING')}</td>`;
+    }
+    html += '</tr>';
   });
   wrap.innerHTML = html + '</table>';
   wrap.classList.remove('hidden');
@@ -638,7 +852,7 @@ function renderSummary() {
   const problems = [];
   state.rows.forEach((stu, i) => {
     const miss = rowMissing(stu);
-    if (miss.length) problems.push(`Row ${i + 1}: ${miss.map(c => c.label).join(', ')}`);
+    if (miss.length) problems.push(`Row ${i + 1}: ${miss.map(c => esc(c.label)).join(', ')}`);
   });
   el.classList.toggle('hidden', !problems.length);
   el.innerHTML = problems.length
@@ -648,7 +862,8 @@ function renderSummary() {
 /* ---------------- export ---------------- */
 const FONT = { name: 'Arial', size: 11 };
 async function buildAndDownload() {
-  let wb, ws, headerRow, cols;
+  let wb, ws, headerRow, cols, startRow;
+  const mi = state.mergeInfo || { ranges: [], slaves: new Set(), spans: {} };
   if (state.workbook) {
     wb = state.workbook;
     ws = wb.getWorksheet(state.sheetName) || wb.worksheets[0];
@@ -663,11 +878,16 @@ async function buildAndDownload() {
         cell.font = { ...FONT, bold: true };
         cell.alignment = { horizontal: 'center' };
       });
+      startRow = headerRow + 1;
+    } else {
+      // append AFTER existing data — never overwrite rows below the header
+      startRow = state.dataStart || headerRow + 1;
     }
   } else {
     wb = new ExcelJS.Workbook();
     ws = wb.addWorksheet('Sheet1');
     headerRow = 1;
+    startRow = 2;
     cols = activeColumns();
     cols.forEach((c, i) => {
       c.col = i + 1;
@@ -679,13 +899,20 @@ async function buildAndDownload() {
     });
   }
 
+  const serialCol = cols.find(c => c.kind === 'serial' && !c.skip);
+  let nextSerial = startSerial(ws, serialCol);
+
   state.rows.forEach((stu, i) => {
-    const row = ws.getRow(headerRow + 1 + i);
+    const r = startRow + i;
+    const row = ws.getRow(r);
     for (const c of cols) {
       if (c.skip) continue;
+      if (mergeMaster(mi, r, c.col)) continue;   // merged cell — value would be lost
       const cell = row.getCell(c.col);
       if (c.kind === 'serial') {
-        cell.value = i + 1;
+        const n = numVal(cell.value);
+        if (n !== null) nextSerial = Math.max(nextSerial, n + 1); // keep prefilled number
+        else cell.value = nextSerial++;
         cell.alignment = { horizontal: 'center' };
         cell.font = FONT;
         continue;
@@ -719,7 +946,7 @@ async function buildAndDownload() {
   a.download = state.excelName ? `filled-${state.excelName}` : 'filled.xlsx';
   a.click();
   URL.revokeObjectURL(a.href);
-  log(`Downloaded ${a.download} — ${state.rows.length} row(s).`);
+  log(`Downloaded ${a.download} — ${state.rows.length} row(s) written at Excel rows ${startRow}–${startRow + state.rows.length - 1}.`);
 }
 
 /* ---------------- wiring ---------------- */

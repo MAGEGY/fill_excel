@@ -12,11 +12,25 @@ A client-side web app that fills any Excel sheet from photos/scans of documents
 2. **Excel** — upload any `.xlsx`. The header row is auto-detected; every column
    becomes a field to fill. Uncheck columns you want to skip. `No.`/serial
    columns are auto-numbered.
+2. **Excel** — upload any `.xlsx`. The header row is auto-detected (merged
+   banner/title rows are ignored); every column becomes a field to fill.
+   Uncheck columns you want to skip. `No.`/serial columns keep any prefilled
+   numbers and continue them for new rows.
 3. **Rows** — press **+ Add row** per record. Inside each row press the small
    **+** to scan a document image. Extracted values fill the row's fields.
-   Fields still empty are flagged **missing** — scan another document for the
-   same row, or press **ignore** on that field.
-4. **Preview & download** — check the table, then download the filled workbook.
+   A photo that shows several people/lines returns one record per person —
+   extra records automatically create new rows. Fields still empty are flagged
+   **missing** — scan another document for the same row, or press **ignore**.
+4. **Preview & download** — Preview renders the sheet as it will look after
+   download: the original title/header rows (with merged cells), the existing
+   data rows, then the new rows highlighted. New rows are **appended after the
+   existing data** (first empty row) — existing rows are never overwritten.
+
+## Robustness
+
+- Templates saved by WPS Office embed drawings with default-namespace XML that
+  crashes ExcelJS; the app detects this and reloads the file without the
+  embedded images so the data still loads.
 
 ## Output formatting
 
