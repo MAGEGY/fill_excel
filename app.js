@@ -692,12 +692,20 @@ async function scanDoc(stu, file, docsEl, scanBtn) {
       const text = await ocrBest(file);
       results = [mapOcrToColumns(extractFields(text))];
     }
-    // First record goes to this row; extra people/records create new rows.
+    // First record fills this row while it still has empty fields; once the
+    // row is complete, the next scanned document starts a new row. Extra
+    // people/records inside one image always create new rows.
     results = results.filter(o => o && typeof o === 'object' && Object.keys(o).length);
     for (let i = 0; i < results.length; i++) {
-      const target = i === 0 ? stu : addRow();
+      let target;
+      if (i === 0 && rowMissing(stu).length) {
+        target = stu;
+      } else {
+        target = addRow();
+        log(`${file.name}: ${i === 0 ? 'row full — continuing in' : 'extra record →'} Row ${state.rows.indexOf(target) + 1}`);
+      }
       const applied = applyResult(target, results[i]);
-      log(`${file.name}${i ? ` (record ${i + 1} → Row ${state.rows.indexOf(target) + 1})` : ''}: ${applied.length ? 'filled → ' + applied.join(', ') : 'nothing new extracted'}`);
+      log(`${file.name}${i ? ` (record ${i + 1})` : ''}: ${applied.length ? 'filled → ' + applied.join(', ') : 'nothing new extracted'}`);
     }
     if (!results.length) log(`${file.name}: nothing extracted`);
     stu.docs.push({ name: file.name });
@@ -860,7 +868,7 @@ function renderSummary() {
 }
 
 /* ---------------- export ---------------- */
-const FONT = { name: 'Arial', size: 11 };
+const FONT = { name: 'Arial', size: 12 };
 async function buildAndDownload() {
   let wb, ws, headerRow, cols, startRow;
   const mi = state.mergeInfo || { ranges: [], slaves: new Set(), spans: {} };
@@ -902,6 +910,25 @@ async function buildAndDownload() {
   const serialCol = cols.find(c => c.kind === 'serial' && !c.skip);
   let nextSerial = startSerial(ws, serialCol);
 
+  // Match the template's own look: per column, copy the font of an existing
+  // data cell (falls back to the header cell's font), never smaller than 12.
+  const fonts = {};
+  if (state.workbook) {
+    for (const c of cols) {
+      let f = null;
+      for (let r = headerRow + 1; r < startRow && !f; r++) {
+        const cell = ws.getCell(r, c.col);
+        const t = cell.value === null || cell.value === undefined ? '' : String(typeof cell.value === 'object' && cell.value.text ? cell.value.text : cell.value).trim();
+        if (t && cell.font && cell.font.size) f = cell.font;
+      }
+      if (!f) {
+        const hc = ws.getCell(headerRow, c.col);
+        if (hc.font && hc.font.size) f = hc.font;
+      }
+      fonts[c.col] = { name: (f && f.name) || 'Arial', size: Math.max(Math.round((f && f.size) || 0) || 12, 12) };
+    }
+  }
+
   state.rows.forEach((stu, i) => {
     const r = startRow + i;
     const row = ws.getRow(r);
@@ -909,12 +936,13 @@ async function buildAndDownload() {
       if (c.skip) continue;
       if (mergeMaster(mi, r, c.col)) continue;   // merged cell — value would be lost
       const cell = row.getCell(c.col);
+      const cfont = fonts[c.col] || FONT;
       if (c.kind === 'serial') {
         const n = numVal(cell.value);
         if (n !== null) nextSerial = Math.max(nextSerial, n + 1); // keep prefilled number
         else cell.value = nextSerial++;
         cell.alignment = { horizontal: 'center' };
-        cell.font = FONT;
+        cell.font = cfont;
         continue;
       }
       const raw = (stu.values[c.col] || '').trim();
@@ -935,7 +963,7 @@ async function buildAndDownload() {
         cell.value = val;
         cell.alignment = { horizontal: 'left', readingOrder: 'ltr', vertical: 'middle' };
       }
-      cell.font = FONT;
+      cell.font = cfont;
     }
   });
 

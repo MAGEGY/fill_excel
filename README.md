@@ -19,8 +19,10 @@ A client-side web app that fills any Excel sheet from photos/scans of documents
 3. **Rows** — press **+ Add row** per record. Inside each row press the small
    **+** to scan a document image. Extracted values fill the row's fields.
    A photo that shows several people/lines returns one record per person —
-   extra records automatically create new rows. Fields still empty are flagged
-   **missing** — scan another document for the same row, or press **ignore**.
+   extra records automatically create new rows. Once a row is full, the next
+   scanned document starts a new row automatically. Fields still empty are
+   flagged **missing** — scan another document for the same row, or press
+   **ignore**.
 4. **Preview & download** — Preview renders the sheet as it will look after
    download: the original title/header rows (with merged cells), the existing
    data rows, then the new rows highlighted. New rows are **appended after the
@@ -34,6 +36,9 @@ A client-side web app that fills any Excel sheet from photos/scans of documents
 
 ## Output formatting
 
+- Extracted cells use the template's own font per column (copied from existing
+  data cells, else the header font; never smaller than 12) — no more tiny 11pt
+  text in tall rows.
 - Dates are written as real dates formatted `dd/mm/yyyy`.
 - Cells containing Arabic are right-aligned (RTL); Latin text left-aligned (LTR).
 - ID/phone columns are stored as text (leading zeros preserved).
