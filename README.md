@@ -16,12 +16,14 @@ A client-side web app that fills any Excel sheet from photos/scans of documents
    banner/title rows are ignored); every column becomes a field to fill.
    Uncheck columns you want to skip. `No.`/serial columns keep any prefilled
    numbers and continue them for new rows.
-3. **Rows** — press **+ Add row** per record. Inside each row press the small
-   **+** to scan a document image. Extracted values fill the row's fields.
-   A photo that shows several people/lines returns one record per person —
-   extra records automatically create new rows. Once a row is full, the next
-   scanned document starts a new row automatically. Fields still empty are
-   flagged **missing** — scan another document for the same row, or press
+3. **Rows** — press **+ Add row** per record (or just scan into the first
+   card). Inside each row press the small **+** to scan document images —
+   select as many as you like at once. Scans are **grouped by person**:
+   documents sharing a name or ID number (passport / iqama) merge into the
+   same row, and each unrecognized person automatically opens a new row —
+   e.g. 20 pictures of 18 students produce 18 rows. A photo that shows
+   several people returns one record per person. Fields still empty are
+   flagged **missing** — scan another document for that person, or press
    **ignore**.
 4. **Preview & download** — Preview renders the sheet as it will look after
    download: the original title/header rows (with merged cells), the existing

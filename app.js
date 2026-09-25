@@ -269,8 +269,61 @@ function renderMapping() {
   }
 }
 
-const fillable = () => state.columns.filter(c => !c.skip && c.kind !== 'serial');
+const fillable = () => activeColumns().filter(c => !c.skip && c.kind !== 'serial');
 const activeColumns = () => state.columns.length ? state.columns : DEFAULT_COLS.map((l, i) => ({ col: i + 1, label: l, kind: classify(l), stdKey: stdKeyOf(l), skip: false }));
+
+/* ---------------- person matching ----------------
+   Scans of the same person arrive across several pictures (passport, iqama,
+   birth certificate, …). Group them: a record joins the row of the person it
+   belongs to; only an unrecognized person opens a new row. */
+const colsForMatching = () => state.columns.length ? state.columns : activeColumns();
+function colIdxOf(stdKey) {
+  const c = colsForMatching().find(c => c.stdKey === stdKey && !c.skip);
+  return c ? c.col : null;
+}
+function recValue(rec, stdKey) {
+  const c = colsForMatching().find(c => c.stdKey === stdKey && !c.skip);
+  return c ? String(rec[c.label] ?? '').trim() : '';
+}
+function rowVal(stu, stdKey) {
+  const col = colIdxOf(stdKey);
+  return col === null ? '' : (stu.values[col] || '').trim();
+}
+function normName(s) {
+  return (s || '').toUpperCase()
+    .replace(/[\u064B-\u0652\u0670]/g, '')            // Arabic tashkeel
+    .replace(/[^\p{L}\p{N} ]+/gu, ' ')
+    .split(/\s+/).filter(Boolean);
+}
+function nameMatch1(A, B) {
+  if (!A.length || !B.length) return false;
+  if (A[0] !== B[0]) return false;                     // given name must lead
+  const inter = A.filter(x => B.includes(x)).length;
+  return inter / Math.min(A.length, B.length) >= 0.6;  // subset of a longer full name
+}
+function nameMatch(a, b) {
+  const A = normName(a), B = normName(b);
+  if (!A.length || !B.length) return false;
+  if ([...new Set(A)].sort().join(' ') === [...new Set(B)].sort().join(' ')) return true;
+  // forward order, or one document printed "Surname, Given"
+  return nameMatch1(A, B) || nameMatch1([...A].reverse(), B) || nameMatch1(A, [...B].reverse());
+}
+function hasIdentifiers(rec) {
+  return !!(recValue(rec, 'name_en') || recValue(rec, 'name_ar') ||
+            recValue(rec, 'passport') || recValue(rec, 'iqama'));
+}
+function findPersonRow(rec) {
+  const rNameEn = recValue(rec, 'name_en'), rNameAr = recValue(rec, 'name_ar');
+  const rPass = recValue(rec, 'passport'), rIqama = recValue(rec, 'iqama');
+  for (const stu of state.rows) {
+    const sPass = rowVal(stu, 'passport'), sIqama = rowVal(stu, 'iqama');
+    if ((rPass && sPass && rPass === sPass) || (rIqama && sIqama && rIqama === sIqama)) return stu;
+    if ((rPass && sPass && rPass !== sPass) || (rIqama && sIqama && rIqama !== sIqama)) continue; // different IDs → different person
+    if ((rNameEn && nameMatch(rNameEn, rowVal(stu, 'name_en'))) ||
+        (rNameAr && nameMatch(rNameAr, rowVal(stu, 'name_ar')))) return stu;
+  }
+  return null;
+}
 
 /* ---------------- image → base64 ---------------- */
 function fileToB64(file, maxDim = 1600) {
@@ -662,9 +715,15 @@ function applyResult(stu, obj) {
   const applied = [];
   for (const c of fillable()) {
     const v = (obj[c.label] ?? '').toString().trim();
-    if (v && !stu.values[c.col] && !stu.ignored.has(c.col)) {
+    if (!v || stu.ignored.has(c.col)) continue;
+    const cur = (stu.values[c.col] || '').trim();
+    if (!cur) {
       stu.values[c.col] = v;
       applied.push(`${c.label}=${v}`);
+    } else if ((c.stdKey === 'name_en' || c.stdKey === 'name_ar') &&
+               nameMatch(cur, v) && normName(v).length > normName(cur).length) {
+      stu.values[c.col] = v;             // a fuller version of the same name
+      applied.push(`${c.label}=${v} (full name)`);
     }
   }
   const card = $(`stu-${stu.id}`);
@@ -692,20 +751,25 @@ async function scanDoc(stu, file, docsEl, scanBtn) {
       const text = await ocrBest(file);
       results = [mapOcrToColumns(extractFields(text))];
     }
-    // First record fills this row while it still has empty fields; once the
-    // row is complete, the next scanned document starts a new row. Extra
-    // people/records inside one image always create new rows.
+    // Route each extracted record to the row of the person it belongs to:
+    // matching name/ID → merge into that row; new person → new row; a record
+    // with no readable name/ID continues the row currently being scanned.
     results = results.filter(o => o && typeof o === 'object' && Object.keys(o).length);
     for (let i = 0; i < results.length; i++) {
-      let target;
-      if (i === 0 && rowMissing(stu).length) {
-        target = stu;
+      const rec = results[i];
+      let target, how;
+      if ((target = findPersonRow(rec))) {
+        how = `same person → merged into Row ${state.rows.indexOf(target) + 1}`;
+      } else if (hasIdentifiers(rec)) {
+        const stuEmpty = !fillable().some(c => (stu.values[c.col] || '').trim());
+        target = stuEmpty ? stu : addRow();
+        how = `new person → Row ${state.rows.indexOf(target) + 1}`;
       } else {
-        target = addRow();
-        log(`${file.name}: ${i === 0 ? 'row full — continuing in' : 'extra record →'} Row ${state.rows.indexOf(target) + 1}`);
+        target = rowMissing(stu).length ? stu : state.rows[state.rows.length - 1];
+        how = `no name/ID on document → Row ${state.rows.indexOf(target) + 1}`;
       }
-      const applied = applyResult(target, results[i]);
-      log(`${file.name}${i ? ` (record ${i + 1})` : ''}: ${applied.length ? 'filled → ' + applied.join(', ') : 'nothing new extracted'}`);
+      const applied = applyResult(target, rec);
+      log(`${file.name}${results.length > 1 ? ` (record ${i + 1})` : ''}: ${how}${applied.length ? ' — ' + applied.join(', ') : ' — nothing new'}`);
     }
     if (!results.length) log(`${file.name}: nothing extracted`);
     stu.docs.push({ name: file.name });
