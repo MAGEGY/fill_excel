@@ -285,9 +285,13 @@ const activeColumns = () => state.columns.length ? state.columns : DEFAULT_COLS.
 const WHO_KEY = '__who';
 const NAME_COL_RE = /name|الاسم|اسم|student|employee|customer|patient|owner|applicant|holder|person|company|entity|title|الشركة|المؤسسة|الطالب|الموظف|العميل|المريض/i;
 const PHONE_COL_RE = /mobile|phone|tel|whatsapp|هاتف|جوال|موبايل|واتس/i;
-const ID_COL_RE = /passport|iqama|اقامة|إقامة|national|identity|\bid\b|id\s*(no|number)|number|no\.?$|رقم|هوية|جواز|serial|reference|ref\.?|invoice|plate|code|كود|مرجع|فاتورة|لوحة/i;
+// True identifiers only — NOT "Nationality" (matched by a bare /national/ before,
+// which made Pakistani vs باكستانية look like conflicting IDs and split one
+// student into two rows, and made two Egyptians "the same person").
+const ID_COL_RE = /passport|iqama|اقامة|إقامة|identity|national\s*(id|no|number)|\bid\b|id\s*(no|number)|number|no\.?$|رقم|هوية|جواز|serial|reference|ref\.?|invoice|plate|chassis|\bvin\b|code|كود|مرجع|فاتورة|لوحة/i;
+const NOT_ID_COL_RE = /nationality|جنسية|birth|ميلاد|address|عنوان|class|grade|صف|gender|sex|جنس/i;
 const matchCols = () => activeColumns().filter(c => !c.skip && c.kind !== 'serial');
-const idCols   = () => matchCols().filter(c => ID_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label) && !NAME_COL_RE.test(c.label) && c.kind !== 'date');
+const idCols   = () => matchCols().filter(c => ID_COL_RE.test(c.label) && !NOT_ID_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label) && !NAME_COL_RE.test(c.label) && c.kind !== 'date');
 const nameCols = () => matchCols().filter(c => NAME_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label));
 const isNameCol = c => NAME_COL_RE.test(c.label) && !PHONE_COL_RE.test(c.label);
 const recVal = (rec, c) => String(rec[c.label] ?? '').trim();
@@ -376,23 +380,25 @@ async function embeddedKey() {
 }
 async function effectiveKey() { return state.settings.apiKey || embeddedKey(); }
 
-function buildPrompt() {
+function buildPrompt(nImages = 1) {
   const fields = fillable().map(c => c.label);
   return [
-    'You are extracting data from a document photo to fill spreadsheet rows.',
-    'The document can be of any kind (ID card, passport, certificate, form, invoice, receipt, letter, list, table, …).',
+    nImages > 1
+      ? `You are extracting data from ${nImages} document photos to fill spreadsheet rows. The photos may belong to the same or to different people/entities — group data by the person/entity it is about, NOT by photo.`
+      : 'You are extracting data from a document photo to fill spreadsheet rows.',
+    'The documents can be of any kind (ID card, passport, certificate, form, invoice, receipt, letter, list, table, …).',
     `Fields to find (use these EXACT strings as JSON keys): ${JSON.stringify(fields)}`,
     'Rules:',
     `- Reply with ONLY JSON: {"rows": [{"${WHO_KEY}": "...", "Field": "value"}, ...]} — one object per person/entity/record.`,
     `- "${WHO_KEY}" = who/what this record is about, for grouping across documents: the full name of the person (or company/item), else the main ID number. Empty string if not determinable.`,
-    '- If the image shows a single document/person, "rows" has ONE object.',
-    '- If the image shows a list, table, or several documents/people, return one object per line/person — do not stop after the first.',
-    '- Fill a field only with data visible in the document that fits the field\'s meaning; omit fields not present.',
+    '- If several photos are about the same person/entity, merge them into ONE object.',
+    '- If a photo shows a list, table, or several documents/people, return one object per line/person — do not stop after the first.',
+    '- Fill a field only with data visible in the document that fits the field\'s meaning; omit fields not present. Never copy one person\'s data into another person\'s object.',
     '- All dates in dd/mm/yyyy format.',
     '- Keep Arabic text in Arabic script; Latin text in Latin script. Do not translate.',
     '- For name fields, always give the FULL name (all parts, in document order) — never split one name across multiple fields.',
     '- ID and phone numbers as plain digits/characters only.',
-    '- If the image is rotated, mentally rotate it first.',
+    '- If an image is rotated, mentally rotate it first.',
   ].join('\n');
 }
 function parseJsonAnswers(txt) {
@@ -409,22 +415,65 @@ function parseJsonAnswers(txt) {
   }
   return [];
 }
-async function aiGemini(b64, mime, key) {
-  const { model } = state.settings;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-  const r = await fetch(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: buildPrompt() }, { inlineData: { mimeType: mime, data: b64 } }] }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0 },
-    }),
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error?.message || r.status);
-  return parseJsonAnswers(j.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '');
+
+/* Rate limiting. The Gemini free tier allows only ~15–20 requests/minute
+   (and a daily cap), so: space requests out, wait + retry on 429 using the
+   server's suggested delay, and on persistent quota errors fall back to
+   sibling models that have their own quota buckets. */
+const MIN_GAP_MS = 4000;
+const GEMINI_FALLBACKS = ['gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'];
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let lastCallAt = 0;
+async function throttle() {
+  const wait = lastCallAt + MIN_GAP_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastCallAt = Date.now();
 }
-async function aiOpenAI(b64, mime, key) {
+function retryDelayMs(err) {
+  const m = /retry in ([\d.]+)\s*s/i.exec(err.message || '');
+  const s = m ? parseFloat(m[1]) : 20;
+  return Math.min(Math.max(s, 5), 65) * 1000 + 500;
+}
+async function withQuotaRetry(call, label) {
+  const models = [state.settings.model, ...GEMINI_FALLBACKS.filter(m => m !== state.settings.model)];
+  let lastErr;
+  for (const model of models) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await throttle();
+        return await call(model);
+      } catch (e) {
+        lastErr = e;
+        const quota = e.status === 429 || /quota|rate.?limit|resource.?exhausted/i.test(e.message || '');
+        if (!quota) throw e;
+        const daily = /per.?day|daily|_requests_per_day|PerDay/i.test(e.message || '');
+        if (daily || attempt === 2) { log(`${label}: quota exhausted on ${model} — trying next model`); break; }
+        const ms = retryDelayMs(e);
+        log(`${label}: rate limit hit on ${model} — waiting ${Math.round(ms / 1000)}s then retrying…`);
+        await sleep(ms);
+      }
+    }
+  }
+  throw lastErr;
+}
+async function aiGemini(images, key, label = 'AI') {
+  return withQuotaRetry(async model => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+    const r = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: buildPrompt(images.length) }, ...images.map(im => ({ inlineData: { mimeType: im.mime, data: im.b64 } }))] }],
+        generationConfig: { responseMimeType: 'application/json', temperature: 0 },
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { const e = new Error(j.error?.message || `HTTP ${r.status}`); e.status = r.status; throw e; }
+    return parseJsonAnswers(j.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '');
+  }, label);
+}
+async function aiOpenAI(images, key) {
   const { model, endpoint } = state.settings;
+  await throttle();
   const r = await fetch(`${endpoint}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -432,13 +481,13 @@ async function aiOpenAI(b64, mime, key) {
       model, temperature: 0,
       response_format: { type: 'json_object' },
       messages: [{ role: 'user', content: [
-        { type: 'text', text: buildPrompt() },
-        { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } },
+        { type: 'text', text: buildPrompt(images.length) },
+        ...images.map(im => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.b64}` } })),
       ]}],
     }),
   });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error?.message || r.status);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(j.error?.message || `HTTP ${r.status}`); e.status = r.status; throw e; }
   return parseJsonAnswers(j.choices?.[0]?.message?.content || '');
 }
 
@@ -686,10 +735,8 @@ function renderRow(stu) {
   scanBtn.onclick = () => fileInput.click();
   fileInput.onchange = async () => {
     scanBtn.disabled = true;
-    for (const f of fileInput.files) await scanDoc(stu, f, docsEl, scanBtn);
-    fileInput.value = '';
-    scanBtn.disabled = false;
-    refreshRow(stu);
+    try { await scanFiles(stu, Array.from(fileInput.files), docsEl, scanBtn); }
+    finally { fileInput.value = ''; scanBtn.disabled = false; refreshRow(stu); }
   };
   docsEl.appendChild(scanBtn);
   docsEl.appendChild(fileInput);
@@ -746,53 +793,82 @@ function applyResult(stu, obj) {
   return applied;
 }
 
-async function scanDoc(stu, file, docsEl, scanBtn) {
-  const thumb = document.createElement('img');
-  thumb.className = 'doc-thumb scanning';
-  thumb.src = URL.createObjectURL(file);
-  docsEl.insertBefore(thumb, scanBtn);
+/* Route extracted records to rows: matching ID/name/identity → merge into
+   that row; new entity → new row; a record with no identifying data at all
+   continues the most recently touched row (usually the same entity's
+   previous document). */
+function routeRecords(stu, results, label) {
+  results = results.filter(o => o && typeof o === 'object' && Object.keys(o).some(k => k !== WHO_KEY && String(o[k] ?? '').trim()));
+  for (let i = 0; i < results.length; i++) {
+    const rec = results[i];
+    const whoTxt = rec[WHO_KEY] ? ` (${rec[WHO_KEY]})` : '';
+    let target, how;
+    if ((target = findPersonRow(rec))) {
+      how = `same entity${whoTxt} → merged into Row ${state.rows.indexOf(target) + 1}`;
+    } else if (hasIdentifiers(rec)) {
+      const stuEmpty = !fillable().some(c => (stu.values[c.col] || '').trim());
+      target = stuEmpty ? stu : addRow();
+      how = `new entity${whoTxt} → Row ${state.rows.indexOf(target) + 1}`;
+    } else {
+      target = state.lastTouched && state.rows.includes(state.lastTouched) ? state.lastTouched : stu;
+      how = `no identifying data → Row ${state.rows.indexOf(target) + 1}`;
+    }
+    const applied = applyResult(target, rec);
+    state.lastTouched = target;
+    log(`${label}${results.length > 1 ? ` (record ${i + 1}/${results.length})` : ''}: ${how}${applied.length ? ' — ' + applied.join(', ') : ' — nothing new'}`);
+  }
+  if (!results.length) log(`${label}: nothing extracted`);
+}
+
+/* Several photos per AI request: 20 pictures become ~7 requests instead of
+   20, which is what keeps us under the free-tier requests-per-minute cap. */
+const BATCH_SIZE = 3;
+async function scanFiles(stu, files, docsEl, scanBtn) {
+  const thumbs = files.map(f => {
+    const t = document.createElement('img');
+    t.className = 'doc-thumb scanning';
+    t.src = URL.createObjectURL(f);
+    docsEl.insertBefore(t, scanBtn);
+    return t;
+  });
   const key = await effectiveKey();
   const useAI = state.settings.provider !== 'offline' && !!key;
-  log(`Scanning ${file.name} via ${useAI ? state.settings.provider : 'offline OCR'} …`);
-  try {
-    let results;
-    if (useAI) {
-      const { b64, mime } = await fileToB64(file);
-      results = state.settings.provider === 'gemini' ? await aiGemini(b64, mime, key) : await aiOpenAI(b64, mime, key);
-    } else {
-      const text = await ocrBest(file);
-      results = [mapOcrToColumns(extractFields(text))];
+  const done = idx => idx.forEach(i => thumbs[i].classList.remove('scanning'));
+  const failed = idx => idx.forEach(i => { thumbs[i].classList.remove('scanning'); thumbs[i].classList.add('failed'); });
+
+  if (!useAI) {
+    for (let i = 0; i < files.length; i++) {
+      log(`Scanning ${files[i].name} via offline OCR …`);
+      try {
+        const text = await ocrBest(files[i]);
+        routeRecords(stu, [mapOcrToColumns(extractFields(text))], files[i].name);
+        stu.docs.push({ name: files[i].name });
+        done([i]);
+      } catch (e) { log(`Scan failed for ${files[i].name}: ${e.message}`); failed([i]); }
     }
-    // Route each extracted record to the row of the entity it belongs to:
-    // matching ID/name/identity → merge into that row; new entity → new row;
-    // a record with no identifying data at all continues the most recently
-    // touched row (usually the same entity's previous document).
-    results = results.filter(o => o && typeof o === 'object' && Object.keys(o).some(k => k !== WHO_KEY && String(o[k] ?? '').trim()));
-    for (let i = 0; i < results.length; i++) {
-      const rec = results[i];
-      let target, how;
-      if ((target = findPersonRow(rec))) {
-        how = `same ${rec[WHO_KEY] ? `entity (${rec[WHO_KEY]})` : 'entity'} → merged into Row ${state.rows.indexOf(target) + 1}`;
-      } else if (hasIdentifiers(rec)) {
-        const stuEmpty = !fillable().some(c => (stu.values[c.col] || '').trim());
-        target = stuEmpty ? stu : addRow();
-        how = `new ${rec[WHO_KEY] ? `entity (${rec[WHO_KEY]})` : 'entity'} → Row ${state.rows.indexOf(target) + 1}`;
-      } else {
-        target = state.lastTouched && state.rows.includes(state.lastTouched) ? state.lastTouched : stu;
-        how = `no identifying data on document → Row ${state.rows.indexOf(target) + 1}`;
-      }
-      const applied = applyResult(target, rec);
-      state.lastTouched = target;
-      log(`${file.name}${results.length > 1 ? ` (record ${i + 1})` : ''}: ${how}${applied.length ? ' — ' + applied.join(', ') : ' — nothing new'}`);
-    }
-    if (!results.length) log(`${file.name}: nothing extracted`);
-    stu.docs.push({ name: file.name });
-  } catch (e) {
-    log(`Scan failed for ${file.name}: ${e.message}`);
-    alert(`Scan failed: ${e.message}`);
-  } finally {
-    thumb.classList.remove('scanning');
+    return;
   }
+
+  const batches = [];
+  for (let i = 0; i < files.length; i += BATCH_SIZE) batches.push(files.slice(i, i + BATCH_SIZE).map((f, k) => i + k));
+  let firstError = null;
+  for (let b = 0; b < batches.length; b++) {
+    const idx = batches[b];
+    const label = batches.length > 1 ? `Batch ${b + 1}/${batches.length}` : files[idx[0]].name;
+    log(`Scanning ${idx.map(i => files[i].name).join(', ')} via ${state.settings.provider} …`);
+    try {
+      const images = await Promise.all(idx.map(i => fileToB64(files[i])));
+      const results = state.settings.provider === 'gemini' ? await aiGemini(images, key, label) : await aiOpenAI(images, key);
+      routeRecords(stu, results, label);
+      idx.forEach(i => stu.docs.push({ name: files[i].name }));
+      done(idx);
+    } catch (e) {
+      log(`Scan failed for ${label}: ${e.message}`);
+      failed(idx);
+      firstError = firstError || e;
+    }
+  }
+  if (firstError) alert(`Some scans failed: ${firstError.message}\n\nFailed pictures are marked red — press + and add them again later.`);
 }
 
 function rowMissing(stu) {

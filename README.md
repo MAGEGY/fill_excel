@@ -35,6 +35,12 @@ A client-side web app that fills any Excel sheet from photos/scans of documents
 
 ## Robustness
 
+- **Free-tier quota.** Gemini's free tier allows only ~15–20 requests per
+  minute (plus a daily cap). The app sends up to 3 pictures per request,
+  spaces requests ≥4 s apart, waits the server-suggested delay and retries on
+  `429`, and on a persistent quota error falls back to sibling models
+  (`gemini-2.5-flash-lite`, `gemini-2.0-flash`, …) that have separate quota
+  buckets. Pictures that still fail are outlined red — just add them again.
 - Templates saved by WPS Office embed drawings with default-namespace XML that
   crashes ExcelJS; the app detects this and reloads the file without the
   embedded images so the data still loads.
